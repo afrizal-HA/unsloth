@@ -133,36 +133,77 @@ def _free_cached_model(model):
     pass
 pass
 
-
+"""
+Method 3
+"""
 def _merge_lora(layer, name):
-
     bias = None
     if isinstance(layer, (Bnb_Linear4bit, Peft_Linear4bit, Peft_Linear)):
         # Is LoRA so we need to merge!
         W, quant_state, A, B, s, bias = get_lora_parameters_bias(layer)
+
+        # Ensure W is on GPU
+        W = W.cuda()
+
         if quant_state is not None:
             dtype = quant_state.dtype if type(quant_state) is not list else quant_state[2]
-            W = fast_dequantize(W, quant_state)
+            W = fast_dequantize(W, quant_state).cuda()  # Ensure dequantized tensor is on GPU
         else:
             dtype = W.dtype
+
         W = W.to(torch.float32).t()
-        # W = W.t()
 
         if A is not None:
-            # sAB = (A.t().to(torch.float32) @ (s * B.t().to(torch.float32)))
-            # W += sAB
-            W.addmm_(A.t().to(torch.float32), B.t().to(torch.float32), alpha = s)
-            # W.addmm_(A.t().to(W.dtype), B.t().to(W.dtype), alpha = s)
-            # if not torch.isfinite(W).all():
+            # Ensure A and B are on GPU and in float32
+            A = A.to(torch.float32).cuda()
+            B = B.to(torch.float32).cuda()
+
+            # Perform the addition on GPU
+            W.addmm_(A.t(), B.t(), alpha=s)
+
             maximum_element = torch.max(W.min().abs(), W.max())
             if not torch.isfinite(maximum_element).item():
                 raise ValueError(f"Unsloth: Merge failed.\n{name} has some elements = infinity.")
-        pass
+
         W = W.t().to(dtype)
     else:
-        W = layer.weight
+        W = layer.weight.cuda()  # Ensure weight is on GPU
+
+    # Ensure bias is on GPU if it exists
+    if bias is not None:
+        bias = bias.cuda()
+
     return W, bias
-pass
+
+# def _merge_lora(layer, name):
+
+#     bias = None
+#     if isinstance(layer, (Bnb_Linear4bit, Peft_Linear4bit, Peft_Linear)):
+#         # Is LoRA so we need to merge!
+#         W, quant_state, A, B, s, bias = get_lora_parameters_bias(layer)
+#         if quant_state is not None:
+#             dtype = quant_state.dtype if type(quant_state) is not list else quant_state[2]
+#             W = fast_dequantize(W, quant_state)
+#         else:
+#             dtype = W.dtype
+#         W = W.to(torch.float32).t()
+#         # W = W.t()
+
+#         if A is not None:
+#             # sAB = (A.t().to(torch.float32) @ (s * B.t().to(torch.float32)))
+#             # W += sAB
+#             W.addmm_(A.t().to(torch.float32), B.t().to(torch.float32), alpha = s)
+#             # W.addmm_(A.t().to(W.dtype), B.t().to(W.dtype), alpha = s)
+#             # if not torch.isfinite(W).all():
+#             maximum_element = torch.max(W.min().abs(), W.max())
+#             if not torch.isfinite(maximum_element).item():
+#                 raise ValueError(f"Unsloth: Merge failed.\n{name} has some elements = infinity.")
+#         pass
+#         W = W.t().to(dtype)
+#     else:
+#         W = layer.weight
+#     return W, bias
+# pass
 
 
 def fast_save_pickle(shard, name):
@@ -240,7 +281,7 @@ def unsloth_save_model(
     # First check for a token!
     if push_to_hub:
         from huggingface_hub import whoami
-        try: 
+        try:
             username = whoami(token = token)["name"]
         except:
             raise RuntimeError(
@@ -371,7 +412,7 @@ def unsloth_save_model(
     else:
         internal_model = model
     pass
-        
+
     # Cannot be converted properly!
     if (save_method == "merged_4bit") or (save_method == "lora") or (
         not hasattr(model, "model") or \
@@ -453,6 +494,38 @@ def unsloth_save_model(
 
     print("Unsloth: Merging 4bit and LoRA weights to 16bit...")
 
+    """
+    Method 1
+    Modify the line
+    `max_ram -= sharded_ram_usage*0.25`
+    to
+    `max_ram -= sharded_ram_usage`
+    
+    Probably doesnt work so ignore this.
+    """
+    # Determine max RAM usage minus sharding
+    # max_ram = psutil.virtual_memory().available
+    # sharded_ram_usage = 5 * 1024 * 1024 * 1024
+    # if type(max_shard_size) is str:
+    #     gb_found = re.match("([0-9]{1,})[\s]{0,}GB", max_shard_size, flags = re.IGNORECASE)
+    #     mb_found = re.match("([0-9]{1,})[\s]{0,}MB", max_shard_size, flags = re.IGNORECASE)
+    #     if   gb_found: sharded_ram_usage = int(gb_found.group(1)) * 1024 * 1024 * 1024
+    #     elif mb_found: sharded_ram_usage = int(mb_found.group(1)) * 1024 * 1024
+    # elif type(max_shard_size) is int:
+    #     sharded_ram_usage = sharded_ram_usage
+
+    # # Only safe_serialization uses more RAM
+    # if safe_serialization:
+    #     max_ram -= sharded_ram_usage
+    # else:
+    #     max_ram -= sharded_ram_usage
+
+    # max_ram = int(max(0, max_ram) * maximum_memory_usage)
+    # print(f"Unsloth: Will use up to "\
+    #       f"{round(max_ram/1024/1024/1024, 2)} out of "\
+    #       f"{round(psutil.virtual_memory().total/1024/1024/1024, 2)} RAM for saving.")
+
+
     # Determine max RAM usage minus sharding
     max_ram = psutil.virtual_memory().available
     sharded_ram_usage = 5 * 1024 * 1024 * 1024
@@ -460,7 +533,7 @@ def unsloth_save_model(
         gb_found = re.match("([0-9]{1,})[\s]{0,}GB", max_shard_size, flags = re.IGNORECASE)
         mb_found = re.match("([0-9]{1,})[\s]{0,}MB", max_shard_size, flags = re.IGNORECASE)
         if   gb_found: sharded_ram_usage = int(gb_found.group(1)) * 1024 * 1024 * 1024
-        elif mb_found: sharded_ram_usage = int(mb_found.group(1)) * 1024 * 1024 
+        elif mb_found: sharded_ram_usage = int(mb_found.group(1)) * 1024 * 1024
     elif type(max_shard_size) is int:
         sharded_ram_usage = sharded_ram_usage
     pass
@@ -526,7 +599,7 @@ def unsloth_save_model(
     # Check modules to save float32 dtype
     state_dict["model.embed_tokens.weight"] = internal_model.model.embed_tokens.weight.data.to(torch_dtype)
 
-    max_vram = int(torch.cuda.get_device_properties(0).total_memory * maximum_memory_usage)
+    # max_vram = int(torch.cuda.get_device_properties(0).total_memory * maximum_memory_usage)
 
     from tqdm import tqdm as ProgressBar
     for j, layer in enumerate(ProgressBar(internal_model.model.layers)):
@@ -539,23 +612,17 @@ def unsloth_save_model(
             if bias is not None:
                 state_dict[f"model.layers.{j}.{item}.bias"] = bias
             pass
-
-            if (torch.cuda.memory_allocated() + W.nbytes) < max_vram:
-                # Save to GPU memory
+            
+            """
+            Method 3
+            """
+            try:
                 state_dict[name] = W
-            # [TODO] Saving to RAM seems to leak memory???
-            # elif (max_ram - W.nbytes) > 0:
-            #     # Save to CPU memory
-            #     logger.warning_once(f"We will save to RAM and not VRAM now.")
-            #     state_dict[name] = W.to("cpu", non_blocking = True, copy = True)
-            #     max_ram = max(max_ram - W.nbytes, 0)
-            else:
-                # Save to Disk
-                logger.warning_once(f"We will save to Disk and not RAM now.")
+            except:
                 filename = os.path.join(temporary_location, f"{name}.pt")
                 torch.save(W, filename, pickle_module = pickle, pickle_protocol = pickle.HIGHEST_PROTOCOL,)
-                # weights_only = True weirdly fails?
-                state_dict[name] = torch.load(filename, map_location = "cpu", mmap = True, weights_only = False)
+                state_dict[name] = torch.load(filename, map_location = "cuda", mmap = True, weights_only = False)
+
         pass
         for item in LLAMA_LAYERNORMS:
             try:
@@ -585,7 +652,7 @@ def unsloth_save_model(
     # Edit save_pretrained_settings
     # [TODO] _create_repo has errors due to **kwargs getting accepted
     save_pretrained_settings["state_dict"] = state_dict
-    
+
     # commit_description does not seem to work?
     what_to_delete = ("use_temp_dir", "commit_message", "create_pr", "revision", "commit_description", "tags",) \
         if not push_to_hub else \
@@ -638,7 +705,7 @@ def unsloth_save_model(
 
         # Revert back padding side
         tokenizer.padding_side = old_padding_side
-            
+
         print(" Done.")
     else:
         print()
@@ -878,7 +945,7 @@ def save_to_gguf(
     else:
         raise TypeError("Unsloth: quantization_method can only be a string or a list of strings")
     pass
-    
+
     # Check if bfloat16 is supported
     if model_dtype == "bf16" and not torch.cuda.is_bf16_supported():
         logger.warning(
@@ -894,7 +961,7 @@ def save_to_gguf(
     pass
 
     # Check I quants
-    for quant_method in quantization_method: 
+    for quant_method in quantization_method:
         if quant_method.startswith("iq2"):
             raise RuntimeError("Unsloth: Currently iq2 type quantizations aren't supported yet - sorry!")
     pass
@@ -949,7 +1016,7 @@ def save_to_gguf(
     # Determine whether the system already has llama.cpp installed and the scripts are executable
     quantize_location = get_executable(["llama-quantize", "quantize"])
     convert_location  = get_executable(["convert-hf-to-gguf.py", "convert_hf_to_gguf.py"])
-    
+
     if quantize_location is not None and convert_location is not None:
         print("Unsloth: llama.cpp found in the system. We shall skip installation.")
     else:
@@ -1058,7 +1125,7 @@ def save_to_gguf(
     if n_cpus is None: n_cpus = 1
     n_cpus *= 2
     # Concurrency from https://rentry.org/llama-cpp-conversions#merging-loras-into-a-model
-    
+
     final_location = f"./{model_directory}/unsloth.{first_conversion.upper()}.gguf"
 
     print(f"Unsloth: [1] Converting model at {model_directory} into {first_conversion} GGUF format.\n"\
@@ -1132,7 +1199,7 @@ def save_to_gguf(
 
             command = f"./{quantize_location} {full_precision_location} "\
                 f"{final_location} {quant_method} {n_cpus}"
-            
+
             # quantize uses stderr
             with subprocess.Popen(command, shell = True, stdout = subprocess.PIPE, stderr = subprocess.STDOUT, bufsize = 1) as sp:
                 for line in sp.stdout:
@@ -1296,7 +1363,7 @@ def _determine_username(save_directory, old_username, token):
     save_directory = save_directory.lstrip("./")
     if "/" not in save_directory:
         from huggingface_hub import whoami
-        try: 
+        try:
             username = whoami(token = token)["name"]
             if type(old_username) is str and username != old_username:
                 username = old_username
@@ -1330,7 +1397,7 @@ def create_huggingface_repo(
             repo_type = "model",
             exist_ok  = False,
             private   = private,
-        ) 
+        )
 
         # Create model card
         from huggingface_hub import ModelCard
@@ -1371,7 +1438,7 @@ def upload_to_huggingface(
             repo_type = "model",
             exist_ok  = False,
             private   = private,
-        ) 
+        )
 
         # Create model card
         from huggingface_hub import ModelCard
@@ -1445,7 +1512,7 @@ def fix_tokenizer_bos_token(tokenizer):
     # Check if BOS added already, then warn
     fix_bos_token = False
     chat_template = getattr(tokenizer, "chat_template", None)
-    
+
     if (tokenizer("A").input_ids[0] == getattr(tokenizer, "bos_token_id", None)):
         if chat_template is not None and \
             (
@@ -1464,7 +1531,7 @@ def fix_tokenizer_bos_token(tokenizer):
             new_chat_template = re.sub(r"\{[\s]{0,}\{[\s]{0,}bos\_token[\s]{0,}\}[\s]{0,}\}", "", chat_template)
             # Remove {{bos_token +
             new_chat_template = re.sub(r"\{[\s]{0,}\{[\s]{0,}bos\_token[\s]{0,}\+[\s]{0,}", "", new_chat_template)
-            
+
             tokenizer.chat_template = new_chat_template
 
         pass
@@ -1627,7 +1694,7 @@ def unsloth_save_pretrained_gguf(
     is_sentencepiece_model = check_if_sentencepiece_model(self)
 
     # Save to GGUF
-    all_file_locations = save_to_gguf(model_type, model_dtype, is_sentencepiece_model, 
+    all_file_locations = save_to_gguf(model_type, model_dtype, is_sentencepiece_model,
         new_save_directory, quantization_method, first_conversion, makefile,
     )
 
@@ -1801,7 +1868,7 @@ def unsloth_push_to_hub_gguf(
     is_sentencepiece_model = check_if_sentencepiece_model(self)
 
     # Save to GGUF
-    all_file_locations = save_to_gguf(model_type, model_dtype, is_sentencepiece_model, 
+    all_file_locations = save_to_gguf(model_type, model_dtype, is_sentencepiece_model,
         new_save_directory, quantization_method, first_conversion, makefile,
     )
 
@@ -1931,8 +1998,8 @@ def unsloth_convert_lora_to_ggml_and_push_to_hub(
 
 def unsloth_convert_lora_to_ggml_and_save_locally(
     self,
-    save_directory: str, # Added parameter for the folder name 
-    tokenizer, 
+    save_directory: str, # Added parameter for the folder name
+    tokenizer,
     temporary_location: str = "_unsloth_temporary_saved_buffers",
     maximum_memory_usage: float = 0.85,
 ):
